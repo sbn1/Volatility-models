@@ -1,50 +1,188 @@
 
-import os
-import sys
+
 import numpy as np
-from matplotlib import cm
-import matplotlib.pyplot as plt
-from matplotlib import ticker
-from mpl_toolkits.mplot3d import Axes3D
-from matplotlib.mlab import griddata
 import pandas as pd
-import math
-from scipy.optimize import brentq
-from scipy.stats import norm
 from datetime import datetime
 import yfinance as yf
+from matplotlib import cm
+import matplotlib.pyplot as plt
+import seaborn as sns
 from typing import Optional
+from scipy.interpolate import interp1d
 
-
-class BuildVolatilitySurface():
-    def __init__(self, symbol:str, expiration_date:Optional[str] = None):
+class BuildVolatilitySurface:
+    def __init__(self, symbol: str, expiration_date: Optional[str] = None, fetch_data: bool = True):
+        """
+        Initialize with a stock symbol and optional expiration date.
+        
+        Parameters:
+            symbol (str): Stock ticker symbol (e.g., 'SPY')
+            fetch_data (bool): Whether to fetch option data during initialization (default: True)
+        
+        Raises:
+            ValueError: If symbol is invalid or expiration_date is in the wrong format
+        """
+        if not isinstance(symbol, str):
+            raise ValueError("Symbol must be a non-empty string")
+        
+        if expiration_date is not None:
+            try:
+                datetime.strptime(expiration_date, '%Y-%m-%d')
+            except ValueError:
+                raise ValueError("Expiration date must be in 'YYYY-MM-DD' format")
+        
         self.symbol = symbol
-        self.extract_option_prices(self.symbol)
-
-
-    def 
-
-    def select_OTM_vols(data:pd.DataFrame):
+        self.expiration_date = expiration_date
+        self.data = pd.DataFrame()  # Initialize empty DataFrame
         
-        options_dfs = []
+        if fetch_data:
+            self.data = self.extract_option_prices(self.symbol, expiration_date=expiration_date)
+    
+    def plot_volatility_smile(self, data:pd.DataFrame, inputed_expiry:str=None):
+        """
+        Plot volatility smile for a specific expiry and the ATM level.
         
-        for expiry in data['expiry'].unique():
-            # Select available strikes for OTM Calls and OTM Puts
-            otm_calls = data[(data['expiry'] == expiry)&(data['option_type'] == "Call")][data['strike'] > data['underlying_price']][['strike', 'impliedVolatility', 'expiry']]
-            otm_puts = data[(data['expiry'] == expiry)&(data['option_type'] == "Put")][data['strike'] < data['underlying_price']][['strike', 'impliedVolatility', 'expiry']]
+        Parameters:
+            data (pd.DataFrame): DataFrame with 'strike', 'impliedVolatility', 'expiry', 'T', 'underlying_price', 'ticker'.
+            inputed_expiry (Optional[str]): Expiry date in 'YYYY-MM-DD' format. If None, uses earliest expiry.
+        """
+        try:
+            if (inputed_expiry is None):
+                selected_expiry = data['expiry'].loc[0]
 
-            # Adding an additional sorting as insurance
-            otm_calls.sort_values(by="strike",ascending=True, inplace=True )
-            otm_puts.sort_values(by="strike",ascending=True, inplace=True )
+            else:
+                selected_expiry = data[pd.to_datetime(data['expiry']) > datetime.strptime(inputed_expiry, '%Y-%m-%d')]['expiry'].unique()[0]
 
-            options_dfs.append(otm_puts)
-            options_dfs.append(otm_calls)
+            vol_smile_data = data.loc[data['expiry'] == selected_expiry, ['strike', 'impliedVolatility']].reset_index(drop=True)
+            if vol_smile_data.empty:
+                raise ValueError(f"No data for expiry {selected_expiry}")
 
-        options_data = pd.concat(options_dfs, ignore_index=True) if options_dfs else pd.DataFrame()
+            underlying_price = data['underlying_price'].loc[0]
+            expiry_set_as_a_ratio = data['T'].loc[0]
+            ticker = data['ticker'].loc[0]
 
-        return options_data
+            sns.set_style("whitegrid")
+            
+            plt.figure(figsize=(10, 5))
+            sns.lineplot(x=vol_smile_data['strike'], y=vol_smile_data['impliedVolatility'], marker='o', linewidth=2, markersize=5)
+            # Interpolate implied volatility at underlying price
+            interpolated_vol = np.interp(underlying_price, sorted(vol_smile_data['strike']), [vol_smile_data['impliedVolatility'][i] for i in np.argsort(vol_smile_data['strike'])])
+            # Plot vertical line from (underlying_price, interpolated_vol) to (underlying_price, 0)
+            plt.plot([underlying_price, underlying_price], [0, interpolated_vol], color='red', linestyle='--', label=f"Underlying Price: {underlying_price:.2f}")
+            # Add a marker at the interpolated point
+            plt.scatter([underlying_price], [interpolated_vol], s=10, zorder=5)
+            
+            plt.title(f"Volatility Smile for {ticker} with maturity on {selected_expiry} (T = {expiry_set_as_a_ratio:.4f})",
+                    fontweight='bold', fontsize=12)
+            plt.xlabel("Strike Price", fontsize=12)
+            plt.ylabel("Implied Volatility", fontsize=12)
+            plt.legend()
+            plt.tight_layout()
 
-    def extract_option_prices(symbol:str="SPY", expiration_date:Optional[str] = None)->pd.DataFrame:
+            plt.show()
+
+        except Exception as e:
+            print(f"Error plotting Vol smile: {e}")
+
+    def plot_volatility_surface(self, data:pd.DataFrame):
+        try:
+            if data.empty:
+                raise ValueError("Input DataFrame is empty")
+            # Create 3D plot
+            fig = plt.figure(figsize=(12, 8))
+            ax = fig.add_subplot(111, projection='3d')
+            # Plot surface
+
+            ax.plot_trisurf(data['strike'], data['T'], data['impliedVolatility'], cmap=cm.jet, linewidth=0.2)
+
+            # Labels and title
+            ax.set_xlabel('Strike Price')
+            ax.set_ylabel('Time to Maturity (Years)')
+            ax.set_zlabel('Implied Volatility')
+            ax.set_title('Volatility Surface')
+            plt.show()
+
+        except Exception as e:
+            print(f"Error plotting volatility surface: {e}")
+
+
+    def get_vols_from_calls_and_puts(self,data:pd.DataFrame, vol_smile_construction_method:str="OTM_Calls_and_OTM_Puts")->pd.DataFrame:
+        """
+        Filter option data based on volatility smile construction method.
+        
+        Parameters:
+            data (pd.DataFrame): DataFrame with option data.
+            vol_smile_construction_method (str): Method to select options ('OTM_Calls_and_OTM_Puts', 'Calls', 'Puts').
+        
+        Returns:
+            pd.DataFrame: Filtered DataFrame with selected options.
+        """
+        try:
+            if data.empty:
+                raise ValueError("Input DataFrame is empty")
+            options_dfs = []
+            
+            for expiry in data['expiry'].unique():
+                # Select available strikes for OTM Calls and OTM Puts
+                if (vol_smile_construction_method == "OTM_Calls_and_OTM_Puts"):
+                    otm_calls = data.loc[
+                                            (data['expiry'] == expiry) & 
+                                            (data['option_type'] == "Call")  & 
+                                            (data['strike'] > data['underlying_price']),
+                                            ['strike', 'impliedVolatility', 'T', 'expiry','ticker', 'underlying_price']
+                                        ]
+                    
+                    otm_puts = data.loc[
+                                            (data['expiry'] == expiry) & 
+                                            (data['option_type'] == "Put") & 
+                                            (data['strike'] < data['underlying_price']),
+                                            ['strike', 'impliedVolatility', 'T', 'expiry','ticker', 'underlying_price']
+                                        ]
+                    
+                    # Adding an additional sorting as insurance
+                    otm_calls.sort_values(by="strike",ascending=True, inplace=True )
+                    otm_puts.sort_values(by="strike",ascending=True, inplace=True )
+
+                    options_dfs.append(otm_puts)
+                    options_dfs.append(otm_calls)
+
+                elif(vol_smile_construction_method == "Calls"):
+                    # Select available strikes for OTM Calls and OTM Puts
+                    calls = data.loc[
+                                        (data['expiry'] == expiry) & 
+                                        (data['option_type'] == "Call"),
+                                        ['strike', 'impliedVolatility', 'T', 'expiry','ticker', 'underlying_price']
+                                    ]
+                    # Adding an additional sorting as insurance
+                    calls.sort_values(by="strike",ascending=True, inplace=True )
+                    options_dfs.append(calls)
+
+                elif(vol_smile_construction_method =="Puts"):
+                    # Select available strikes for OTM Calls and OTM Puts
+                    puts = data.loc[
+                                        (data['expiry'] == expiry) & 
+                                        (data['option_type'] == "Put"),
+                                        ['strike', 'impliedVolatility', 'T', 'expiry','ticker', 'underlying_price']
+                                    ]
+                    # Adding an additional sorting as insurance
+                    puts.sort_values(by="strike",ascending=True, inplace=True )
+
+
+                    options_dfs.append(puts)
+
+                else:
+                    raise ValueError("Allowed volatility construction methods include: ['OTM_Calls_and_OTM_Puts', 'Calls', 'Puts'] ")
+
+            options_data = pd.concat(options_dfs, ignore_index=True) if options_dfs else pd.DataFrame()
+
+            return options_data
+        
+        except Exception as e:
+            print(f"Error in get_vols_from_calls_and_puts: {e}")
+            return pd.DataFrame()
+
+    
+    def extract_option_prices(self,symbol:str="SPY", as_of_date:Optional[str]=None, expiration_date:Optional[str] = None)->pd.DataFrame:
         """
         Extract option prices for a given stock ticker and optional expiration date.
         
@@ -76,9 +214,8 @@ class BuildVolatilitySurface():
                 else:
                     return {f"Unable to retrieve underlying price for {symbol}"}
             # Get the dividend yield
-            dividendYield = stock.info.get("dividendYield", None)
-            if underlying_price is None:
-                dividendYield = 0.0
+            dividendYield = stock.info.get("dividendYield", 0.0) or 0.0
+
 
             # Get available expiration dates
             expiries = stock.options
@@ -95,7 +232,8 @@ class BuildVolatilitySurface():
                     selected_expiries = [expiries[0]]
                     print(f"Expiration date {expiration_date} not found. Using first available: {expiries[0]}")
             
-
+            as_of_date = pd.to_datetime(as_of_date) if as_of_date else datetime.now()
+                
             # Initialize list to store DataFrames
             options_dfs = []
             
@@ -120,10 +258,13 @@ class BuildVolatilitySurface():
                 puts["expiry"] = expiry
                 calls["option_type"] = "Call"
                 puts["option_type"] = "Put"
+                # T - expiry is computed in seconds and then converted in days 
+                calls['T'] =(pd.to_datetime(expiry) - as_of_date ).total_seconds()/(365*24*60)
+                puts['T'] = (pd.to_datetime(expiry) - as_of_date ).total_seconds()/(365*24*60)
                 
                 # Select relevant columns to include in the output
                 columns = ["contractSymbol", "strike", "lastPrice", "bid", "ask", "volume", "openInterest", 'lastTradeDate',
-                        "impliedVolatility", "inTheMoney", "ticker", "underlying_price", "expiry", "option_type", 'dividendYield']
+                        "impliedVolatility", "inTheMoney", "ticker", "underlying_price", "expiry","T", "option_type", 'dividendYield']
                 calls = calls[[col for col in columns if col in calls.columns]]
                 puts = puts[[col for col in columns if col in puts.columns]]
 
@@ -144,104 +285,111 @@ class BuildVolatilitySurface():
         except Exception as e:
             print(f"Error fetching option prices for {symbol}: {str(e)}")
             return pd.DataFrame()
+        
+    def compute_implied_interest_rates(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Computes implied interest rates per expiry using put-call parity, interpolating prices if strikes don't match.
+        
+        Parameters:
+            data (pd.DataFrame): DataFrame with option's data
+            
+        Returns:
+        data (pd.DataFrame):  Adds the implied interest rates as a column to the inputted dataframe
+        """
+        
+        try:
+            # Validate input DataFrame
+            required_cols = ['strike', 'ticker', 'underlying_price', 'option_type', 'expiry', 'T', 'dividendYield', 'lastPrice']
+            if not all(col in data.columns for col in required_cols):
+                raise ValueError("DataFrame must contain 'strike', 'lastPrice','underlying_price', 'option_type', 'expiry' and 'T' columns")
+            if data.empty:
+                raise ValueError("Input DataFrame is empty")
+
+            # Unique expiries
+            expiries_unique = np.sort(data['T'].unique())
+            #Get the divident yield - it is inputed as percentage
+            q = data['dividendYield'][0]/100
+            #Get the underlying price
+            S = data['underlying_price'][0]
+            
+            implied_interest_rates = {}
+
+            for T in expiries_unique:
+                data_T = data[data['T'] == T]
+                
+                # Separate call and put data
+                call_data = data_T.loc[data_T['option_type'] == "Call", ['strike', 'option_type', 'lastPrice']]
+                put_data = data_T.loc[data_T['option_type'] == "Put", ['strike', 'option_type', 'lastPrice']]
+                
+                # Get unique strikes for calls and puts
+                call_strikes = np.sort(call_data['strike'].unique())
+                put_strikes = np.sort(put_data['strike'].unique())
+                
+                # Find common strikes
+                common_strikes = np.intersect1d(call_strikes, put_strikes)
+                
+                # If no common strikes, interpolate to align strikes
+                if len(common_strikes) == 0:
+                    if len(call_strikes) < 2 or len(put_strikes) < 2:
+                        implied_interest_rates[T] = np.nan  # Insufficient data for interpolation
+                        continue
+                    
+                    # Interpolate call prices at put strikes
+                    call_interp = interp1d(call_strikes, call_data.set_index('strike')['lastPrice'], 
+                                        bounds_error=False, fill_value='extrapolate')
+                    put_interp = interp1d(put_strikes, put_data.set_index('strike')['lastPrice'], 
+                                        bounds_error=False, fill_value='extrapolate')
+                    
+                    # Use all unique strikes
+                    all_strikes = np.sort(np.union1d(call_strikes, put_strikes))
+                    rates = []
+                    for K in all_strikes:
+                        try:
+                            C = call_interp(K)
+                            P = put_interp(K)
+                            if C >= 0 and P >= 0 and K > 0:
+                                # Compute interest rate using Put-call parity: C - P = S e^(-qT) - K e^(-rT)
+                                
+                                r = -np.log((S * np.exp(-q * T) - (C - P)) / K) / T
+                                if -1 < r < 1:  # Filter unrealistic rates
+                                    rates.append(r)
+                        except:
+                            continue
+                else:
+                    # Use common strikes directly
+                    rates = []
+                    for K in common_strikes:
+                        C = call_data[call_data['strike'] == K]['lastPrice'].iloc[0]
+                        P = put_data[put_data['strike'] == K]['lastPrice'].iloc[0]
+                        try:
+                            if C >= 0 and P >= 0 and K > 0:
+                                r = - np.log((S * np.exp(-q * T) - (C - P)) / K) / T
+
+                                if -1 < r < 1:  # Filter unrealistic rates
+                                    rates.append(r)
+                        except:
+                            continue
+                
+                # Average rates for this expiry
+                implied_interest_rates[T] = np.nanmean(rates) if rates else np.nan
+
+            data['implied_interest_rate'] = data['T'].map(implied_interest_rates).astype(float)
+            
+            return data
+        
+        except Exception as e:
+            print(f"Error computing implied interest rates: {e}")
+            return {}
+
+
+
+
 if __name__ == "__main__":
     
-    df = extract_option_prices(symbol="SPY")
+    vol_surface = BuildVolatilitySurface(symbol="SPY")
+    # vol_surface = BuildVolatilitySurface(symbol="SPY", expiration_date='2025-12-30')
+    data = vol_surface.get_vols_from_calls_and_puts(vol_surface.data, "OTM_Calls_and_OTM_Puts")
+    vol_surface.plot_volatility_smile(data, inputed_expiry=None)
+    vol_surface.plot_volatility_surface(data)
 
-    df[(df['expiry']=="2025-08-29") & (df['strike'] == 550)]
 
-    plt.plot(df[(df['expiry']=="2025-08-29")&(df['option_type']=="Call")]['strike'], df[(df['expiry']=="2025-08-29")&(df['option_type']=="Call")]['impliedVolatility'], label="Call")
-    plt.plot(df[(df['expiry']=="2025-08-29")&(df['option_type']=="Put")]['strike'], df[(df['expiry']=="2025-08-29")&(df['option_type']=="Put")]['impliedVolatility'], label="Put")
-    plt.legend()
-    plt.show()
-
-    from scipy.interpolate import CubicSpline
-
-def interpolate_volatility(strikes, implied_vols):
-    """
-    Interpolate implied volatilities across strike prices using cubic spline.
-    
-    Parameters:
-    - strikes (list of float): List of strike prices.
-    - implied_vols (list of float): List of corresponding implied volatilities (as decimals, e.g., 0.2 for 20%).
-    
-    Returns:
-    - callable: A function that takes a strike price (float) and returns the interpolated implied volatility.
-    - tuple: (min_strike, max_strike) defining the valid range for interpolation.
-    - None: If data is insufficient or an error occurs.
-    """
-    try:
-        # Convert inputs to numpy arrays
-        strikes = np.array(strikes, dtype=float)
-        implied_vols = np.array(implied_vols, dtype=float)
-        
-        # Validate inputs
-        if len(strikes) != len(implied_vols):
-            print("Error: Strikes and implied volatilities must have the same length")
-            return None, None
-        if len(strikes) < 4:
-            print(f"Error: At least 4 data points required for cubic spline interpolation, got {len(strikes)}")
-            return None, None
-        
-        # Filter out invalid data (NaN or non-positive volatilities)
-        valid_mask = (implied_vols > 0) & (~np.isnan(strikes)) & (~np.isnan(implied_vols))
-        strikes = strikes[valid_mask]
-        implied_vols = implied_vols[valid_mask]
-        
-        if len(strikes) < 4:
-            print(f"Error: Insufficient valid data points ({len(strikes)}) after filtering")
-            return None, None
-        
-        # Sort by strike price
-        sorted_indices = np.argsort(strikes)
-        strikes = strikes[sorted_indices]
-        implied_vols = implied_vols[sorted_indices]
-        
-        # Check for duplicate strikes
-        if len(np.unique(strikes)) < len(strikes):
-            print("Error: Duplicate strike prices detected")
-            return None, None
-        
-        # Create cubic spline interpolation
-        cs = CubicSpline(strikes, implied_vols, bc_type='natural')
-        
-        # Define interpolation function
-        def volatility_interpolator(strike):
-            """
-            Interpolate implied volatility for a given strike price.
-            
-            Parameters:
-            - strike (float): Strike price to evaluate.
-            
-            Returns:
-            - float: Interpolated implied volatility, or None if strike is out of range.
-            """
-            if not isinstance(strike, (int, float)) or strike < strikes[0] or strike > strikes[-1]:
-                print(f"Strike {strike} is invalid or outside the valid range [{strikes[0]}, {strikes[-1]}]")
-                return None
-            return cs(strike)
-        
-        return volatility_interpolator, (strikes[0], strikes[-1])
-    
-    except Exception as e:
-        print(f"Error interpolating volatility: {e}")
-        return None, None
-
-# Example usage
-if __name__ == "__main__":
-    # Sample data
-    strikes = [100, 110, 120, 130, 140]
-    implied_vols = [0.25, 0.20, 0.18, 0.20, 0.24]
-    
-    vol_func, strike_range = interpolate_volatility(strikes, implied_vols)
-    
-    if vol_func is not None:
-        print(f"Valid strike range: {strike_range}")
-        # Test interpolation
-        test_strikes = [105, 115, 135]
-        for strike in test_strikes:
-            vol = vol_func(strike)
-            if vol is not None:
-                print(f"Interpolated implied volatility at strike {strike:.2f}: {vol * 100:.2f}%")
-    else:
-        print("Failed to interpolate volatility")
