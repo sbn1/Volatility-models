@@ -8,7 +8,8 @@ from matplotlib import cm
 import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Optional
-from scipy.interpolate import interp1d
+from scipy.interpolate import interp1d,RectBivariateSpline
+
 
 class BuildVolatilitySurface:
     def __init__(self, symbol: str, expiration_date: Optional[str] = None, fetch_data: bool = True):
@@ -296,7 +297,7 @@ class BuildVolatilitySurface:
         Returns:
         data (pd.DataFrame):  Adds the implied interest rates as a column to the inputted dataframe
         """
-        
+
         try:
             # Validate input DataFrame
             required_cols = ['strike', 'ticker', 'underlying_price', 'option_type', 'expiry', 'T', 'dividendYield', 'lastPrice']
@@ -373,6 +374,7 @@ class BuildVolatilitySurface:
                 # Average rates for this expiry
                 implied_interest_rates[T] = np.nanmean(rates) if rates else np.nan
 
+            # Adding average interest rates for each maturity T in the original dataset
             data['implied_interest_rate'] = data['T'].map(implied_interest_rates).astype(float)
             
             return data
@@ -380,7 +382,167 @@ class BuildVolatilitySurface:
         except Exception as e:
             print(f"Error computing implied interest rates: {e}")
             return {}
+        
+    def compute_local_volatility(self, data: pd.DataFrame, num_strikes: int = 50, num_expiries: int = 50) -> pd.DataFrame:
+        """
+        Compute local volatility surface from a DataFrame with option prices, strikes, maturities, and interest rates.
+        Uses call prices directly or estimates them from put prices via put-call parity if call prices are missing.
+        
+        Parameters:
+        data (pd.DataFrame): DataFrame with columns 'strike','T','option_type','impliedVolatility' 'lastPrice','underlying_price',
+                            'dividendYield' and 'implied_interest_rate' to estimate missing call prices.
 
+        num_strikes (int): Number of strike points in output grid (default: 50).
+        num_expiries (int): Number of expiry points in output grid (default: 50).
+        
+        Returns:
+            pd.DataFrame: DataFrame with columns 'strike', 'T', and 'LocalVolatility'.
+        """
+        try:
+
+            #Update the inputted dataframe to include the implied interest rates
+            data = self.compute_implied_interest_rates(data)
+
+            # Validate input DataFrame
+            required_cols = ['strike','T','option_type','impliedVolatility' 'lastPrice','underlying_price','dividendYield', 'implied_interest_rate']
+
+            if not all(col in data.columns for col in required_cols):
+                raise ValueError("DataFrame must contain 'strike','T','option_type','impliedVolatility' 'lastPrice','underlying_price','dividendYield' and 'implied_interest_rate' columns")
+            
+
+            if data.empty:
+                raise ValueError("Input DataFrame is empty")
+
+            # Create a copy to avoid modifying the original
+            df = data.copy()
+            
+            
+            # Unique strikes and expiries
+            strikes_unique = np.sort(df['strike'].unique())
+            expiries_unique = np.sort(df['T'].unique())
+
+            # strikes_unique = np.sort(df[df['option_type']=="Call"]['strike'].unique())
+            # expiries_unique = np.sort(df[df['option_type']=="Call"]['T'].unique())
+
+            S = data['underlying_price'][0]
+            q = data['dividendYield'][0]
+            
+            # Interpolate call price surface, using put prices if call prices are missing
+            # For Dupire equaiton onyl the prices of the Calls are required
+            price_grid = np.zeros((len(expiries_unique), len(strikes_unique)))
+
+            for i, T in enumerate(expiries_unique):
+                r = df[df['T'] == T]['implied_interest_rate'].iloc[0]
+                if np.isnan(r):
+                    print(f"Warning: No valid interest rate for T={T}, using default r=0.012")
+                    r = 0.012
+                for j, K in enumerate(strikes_unique):
+
+                    subset = df[(df['T'] == T) & (df['strike'] == K)]
+
+                    if not subset.empty:
+                        call_subset = subset[subset['option_type'] == 'Call']
+                        put_subset = subset[subset['option_type'] == 'Put']
+
+                        if not call_subset.empty and not call_subset['lastPrice'].isna().any():
+                            price_grid[i, j] = call_subset['lastPrice'].iloc[0]
+
+
+                        elif not put_subset.empty and not put_subset['lastPrice'].isna().any():
+                            # Use put-call parity: C = P + S e^(-qT) - K e^(-rT)
+                            P = put_subset['lastPrice'].iloc[0]
+                            price_grid[i, j] = P + S * np.exp(-q * T) - K * np.exp(-r * T)
+
+                        else:
+                            price_grid[i, j] = np.nan
+                    else:
+                        price_grid[i, j] = np.nan
+
+            
+            # Handle NaN in price grid
+            price_grid = np.nan_to_num(price_grid, nan=0.0)
+
+
+            interp_price = RectBivariateSpline(expiries_unique, strikes_unique, price_grid, kx=2, ky=2)
+            
+            # Create output grid
+            strikes = np.linspace(min(strikes_unique), max(strikes_unique), num_strikes)
+            expiries = np.linspace(min(expiries_unique), max(expiries_unique), num_expiries)
+            local_vol_grid = np.zeros((num_expiries, num_strikes))
+            
+            # Small increments for numerical derivatives
+            dT = 1e-4
+            dK = 1e-4
+            
+            for i, T in enumerate(expiries):
+                # Interpolate interest rate for this T
+                r = df[df['T'] == T]['implied_interest_rate'].iloc[0]
+                if np.isnan(r):
+                    print(f"Warning: No valid interest rate for T={T}, using default r=0.012")
+                    r = 0.012
+                for j, K in enumerate(strikes):
+                    # Get call price
+                    C = interp_price(T, K)[0][0]
+                    # a sanity check for the Interpolation results
+                    if (T <= 0 or C < 0):
+                        C = max(S - K, 0)
+                    
+                    # Numerical derivatives using interpolation
+                    C_dT = interp_price(T + dT, K)[0][0] if T + dT > 0 else max(S - K, 0)
+                    dC_dT = (C_dT - C) / dT
+                    
+                    C_dK = interp_price(T, K + dK)[0][0] if T > 0 else max(S - (K + dK), 0)
+                    dC_dK = (C_dK - C) / dK
+                    
+                    C_dK2 = interp_price(T, K + 2*dK)[0][0] if T > 0 else max(S - (K + 2*dK), 0)
+                    d2C_dK2 = (C_dK2 - 2*C_dK + C) / (dK**2)
+                    
+                    # Dupire formula
+                    numerator = dC_dT + (r - q) * K * dC_dK + q * C
+                    denominator = 0.5 * K**2 * d2C_dK2
+                    try:
+                        if denominator > 0 and numerator > 0:
+                            local_vol_grid[i, j] = np.sqrt(numerator / denominator)
+                        else:
+                            local_vol_grid[i, j] = np.nan
+                    except (ZeroDivisionError, ValueError):
+                        local_vol_grid[i, j] = np.nan
+            
+            # Create output DataFrame
+            strike_grid, expiry_grid = np.meshgrid(strikes, expiries)
+            result_df = pd.DataFrame({
+                'strike': strike_grid.ravel(),
+                'T': expiry_grid.ravel(),
+                'LocalVolatility': local_vol_grid.ravel()
+            })
+            
+            return result_df
+        
+        except Exception as e:
+            print(f"Error computing local volatility: {e}")
+            return pd.DataFrame(columns=['strike', 'T', 'LocalVolatility'])
+
+
+    def plot_Local_volatility_surface(data:pd.DataFrame):
+        try:
+            if data.empty:
+                raise ValueError("Input DataFrame is empty")
+            # Create 3D plot
+            fig = plt.figure(figsize=(12, 8))
+            ax = fig.add_subplot(111, projection='3d')
+            # Plot surface
+
+            ax.plot_trisurf(data['strike'], data['T'], data['LocalVolatility'], cmap=cm.jet, linewidth=0.2)
+
+            # Labels and title
+            ax.set_xlabel('Strike Price')
+            ax.set_ylabel('Time to Maturity (Years)')
+            ax.set_zlabel('Implied Volatility')
+            ax.set_title('Volatility Surface')
+            plt.show()
+
+        except Exception as e:
+            print(f"Error plotting volatility surface: {e}")
 
 
 
