@@ -1,5 +1,3 @@
-
-
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -9,6 +7,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Optional
 from scipy.interpolate import interp1d,RectBivariateSpline
+from functools import reduce
 
 
 class BuildVolatilitySurface:
@@ -287,7 +286,7 @@ class BuildVolatilitySurface:
             print(f"Error fetching option prices for {symbol}: {str(e)}")
             return pd.DataFrame()
         
-    def compute_implied_interest_rates(self, data: pd.DataFrame) -> pd.DataFrame:
+    def compute_implied_interest_rates( self, data: pd.DataFrame) -> pd.DataFrame:
         """
         Computes implied interest rates per expiry using put-call parity, interpolating prices if strikes don't match.
         
@@ -376,6 +375,8 @@ class BuildVolatilitySurface:
 
             # Adding average interest rates for each maturity T in the original dataset
             data['implied_interest_rate'] = data['T'].map(implied_interest_rates).astype(float)
+
+            
             
             return data
         
@@ -392,6 +393,7 @@ class BuildVolatilitySurface:
         data (pd.DataFrame): DataFrame with columns 'strike','T','option_type','impliedVolatility' 'lastPrice','underlying_price',
                             'dividendYield' and 'implied_interest_rate' to estimate missing call prices.
 
+
         num_strikes (int): Number of strike points in output grid (default: 50).
         num_expiries (int): Number of expiry points in output grid (default: 50).
         
@@ -404,7 +406,7 @@ class BuildVolatilitySurface:
             data = self.compute_implied_interest_rates(data)
 
             # Validate input DataFrame
-            required_cols = ['strike','T','option_type','impliedVolatility' 'lastPrice','underlying_price','dividendYield', 'implied_interest_rate']
+            required_cols = ['strike','T','option_type','impliedVolatility' ,'lastPrice','underlying_price','dividendYield', 'implied_interest_rate']
 
             if not all(col in data.columns for col in required_cols):
                 raise ValueError("DataFrame must contain 'strike','T','option_type','impliedVolatility' 'lastPrice','underlying_price','dividendYield' and 'implied_interest_rate' columns")
@@ -418,17 +420,19 @@ class BuildVolatilitySurface:
             
             
             # Unique strikes and expiries
-            strikes_unique = np.sort(df['strike'].unique())
-            expiries_unique = np.sort(df['T'].unique())
+            # strikes_unique = np.sort(df['strike'].unique())
+            # expiries_unique = np.sort(df['T'].unique())
 
-            # strikes_unique = np.sort(df[df['option_type']=="Call"]['strike'].unique())
-            # expiries_unique = np.sort(df[df['option_type']=="Call"]['T'].unique())
+            strikes_unique = np.sort(df[df['option_type']=="Call"]['strike'].unique())
+            expiries_unique = np.sort(df[df['option_type']=="Call"]['T'].unique())
 
-            S = data['underlying_price'][0]
-            q = data['dividendYield'][0]
+
+            S = df['underlying_price'][0]
+            q = df['dividendYield'][0]
+
             
             # Interpolate call price surface, using put prices if call prices are missing
-            # For Dupire equaiton onyl the prices of the Calls are required
+            # For Dupire equation only the prices of the Calls are required
             price_grid = np.zeros((len(expiries_unique), len(strikes_unique)))
 
             for i, T in enumerate(expiries_unique):
@@ -438,6 +442,7 @@ class BuildVolatilitySurface:
                     r = 0.012
                 for j, K in enumerate(strikes_unique):
 
+                    #Warning: for different maturites the Strikes are not the same 
                     subset = df[(df['T'] == T) & (df['strike'] == K)]
 
                     if not subset.empty:
@@ -449,6 +454,7 @@ class BuildVolatilitySurface:
 
 
                         elif not put_subset.empty and not put_subset['lastPrice'].isna().any():
+
                             # Use put-call parity: C = P + S e^(-qT) - K e^(-rT)
                             P = put_subset['lastPrice'].iloc[0]
                             price_grid[i, j] = P + S * np.exp(-q * T) - K * np.exp(-r * T)
@@ -469,14 +475,33 @@ class BuildVolatilitySurface:
             strikes = np.linspace(min(strikes_unique), max(strikes_unique), num_strikes)
             expiries = np.linspace(min(expiries_unique), max(expiries_unique), num_expiries)
             local_vol_grid = np.zeros((num_expiries, num_strikes))
-            
+
+
+            # Interpolate interest rates
+            # Get unique (T, implied_interest_rate) pairs only for Call options
+            implied_rates_data = df[df['option_type'] == "Call"][['T', 'implied_interest_rate']].drop_duplicates()
+        
+            if len(implied_rates_data) < 2:
+                print("Warning: Insufficient valid interest rate data, using default r=0.012 for all expiries.")
+                interpolated_implied_rates = lambda x: 0.012
+            else:
+                # Sort by T to ensure monotonicity for interpolation
+                implied_rates_data = implied_rates_data.sort_values('T')
+                interpolated_implied_rates = interp1d(
+                    implied_rates_data['T'],
+                    implied_rates_data['implied_interest_rate'],
+                    kind='linear',
+                    bounds_error=False,
+                    fill_value=0.012  # Default rate outside bounds
+                )
+                        
             # Small increments for numerical derivatives
-            dT = 1e-4
-            dK = 1e-4
+            dT = 1e-2
+            dK = 1e-2
             
             for i, T in enumerate(expiries):
                 # Interpolate interest rate for this T
-                r = df[df['T'] == T]['implied_interest_rate'].iloc[0]
+                r = interpolated_implied_rates(T)
                 if np.isnan(r):
                     print(f"Warning: No valid interest rate for T={T}, using default r=0.012")
                     r = 0.012
@@ -523,7 +548,7 @@ class BuildVolatilitySurface:
             return pd.DataFrame(columns=['strike', 'T', 'LocalVolatility'])
 
 
-    def plot_Local_volatility_surface(data:pd.DataFrame):
+    def plot_Local_volatility_surface(self, data:pd.DataFrame):
         try:
             if data.empty:
                 raise ValueError("Input DataFrame is empty")
@@ -550,8 +575,12 @@ if __name__ == "__main__":
     
     vol_surface = BuildVolatilitySurface(symbol="SPY")
     # vol_surface = BuildVolatilitySurface(symbol="SPY", expiration_date='2025-12-30')
-    data = vol_surface.get_vols_from_calls_and_puts(vol_surface.data, "OTM_Calls_and_OTM_Puts")
-    vol_surface.plot_volatility_smile(data, inputed_expiry=None)
-    vol_surface.plot_volatility_surface(data)
+    # data = vol_surface.get_vols_from_calls_and_puts(vol_surface.data, "OTM_Calls_and_OTM_Puts")
+    # vol_surface.plot_volatility_smile(data, inputed_expiry=None)
+    # vol_surface.plot_volatility_surface(data)
+    local_vol = vol_surface.compute_local_volatility(vol_surface.data)
+
+    vol_surface.plot_Local_volatility_surface(local_vol)
+
 
 
